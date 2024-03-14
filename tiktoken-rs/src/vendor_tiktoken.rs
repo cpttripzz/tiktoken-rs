@@ -1,128 +1,89 @@
 // This check is new and seems buggy (possibly with PyO3 interaction)
 #![allow(clippy::borrow_deref_ref)]
 
-use std::collections::HashSet;
-use std::thread;
-
 use anyhow::anyhow;
+
 use anyhow::Result;
 use fancy_regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
+use std::collections::HashSet;
+use std::num::NonZeroU64;
+use std::thread;
 
-#[cfg(feature = "python")]
-use pyo3::exceptions;
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use pyo3::types::{PyBytes, PyList, PyTuple};
+pub type Rank = u32;
 
-fn _byte_pair_merge<T>(
-    piece: &[u8],
-    ranks: &HashMap<Vec<u8>, usize>,
-    f: impl Fn(std::ops::Range<usize>) -> T,
-) -> Vec<T> {
+fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
     // This is a vector of (start, rank).
-    // The rank is of the byte pair starting at position start.
-    // The rank of the last item in the vector is not a valid value.
-    let mut parts: Vec<(usize, usize)> = (0..piece.len() + 1).map(|i| (i, usize::MAX)).collect();
+    // The rank is of the pair starting at position start.
+    let mut parts = Vec::with_capacity(piece.len() + 1);
 
-    // NOTE: using a macro here because a closure fails to get inlined
-    // according to optimization remarks.
-    // A closure also cannot capture a reference to `piece` without
-    // the borrow checker complaining about the mutable borrows during
-    // the assignments later in this code.
-    macro_rules! get_rank {
-        ($start_idx:expr, $skip:expr) => {{
-            let start_idx: usize = $start_idx;
-            let skip: usize = $skip;
-            if (start_idx + skip + 2) < parts.len() {
-                ranks
-                    .get(&piece[parts[start_idx].0..parts[start_idx + skip + 2].0])
-                    .map(|r| *r)
+    // Note that we hash bytes when indexing into `ranks`, not token pairs. As long as we train BPE
+    // the way we currently do, this is equivalent. An easy way to break this would be to decouple
+    // merge priority from token index or to prevent specific token merges.
+    let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
+    for i in 0..piece.len() - 1 {
+        let rank = *ranks.get(&piece[i..i + 2]).unwrap_or(&Rank::MAX);
+        if rank < min_rank.0 {
+            min_rank = (rank, i);
+        }
+        parts.push((i, rank));
+    }
+    parts.push((piece.len() - 1, Rank::MAX));
+    parts.push((piece.len(), Rank::MAX));
+
+    let get_rank = {
+        #[inline(always)]
+        |parts: &Vec<(usize, Rank)>, i: usize| {
+            if (i + 3) < parts.len() {
+                // Similar to `piece[i..i + 2]` above. The +3 is because we haven't yet deleted
+                // parts[i + 1], see comment in the main loop.
+                *ranks
+                    .get(&piece[parts[i].0..parts[i + 3].0])
+                    .unwrap_or(&Rank::MAX)
             } else {
-                None
+                Rank::MAX
             }
-        }};
-        ($idx:expr) => {{
-            get_rank!($idx, 0)
-        }};
-    }
-
-    // We look up the ranks once in the beggining and iteratively update
-    // them during each merge, which reduces the number of rank lookups.
-    for i in 0..parts.len() - 2 {
-        match get_rank!(i) {
-            Some(rank) => {
-                // usize::MAX is a sentinel value and cannot be a valid rank
-                debug_assert!(rank != usize::MAX);
-                parts[i].1 = rank;
-            }
-            None => {
-                continue;
-            }
-        };
-    }
+        }
+    };
 
     // If you have n parts and m merges, this does O(mn) work.
     // We could do something with a heap and do O(m log n) work.
-    // It is important to consider that n is often small (<100), and as such
-    // the cache-locality benefits outweigh the algorithmic complexity downsides
-    // of the `parts` vector data structure above.
-
-    // Note that we hash bytes, not token pairs. As long as we train BPE the way we
-    // currently do, this is equivalent. An easy way to break this would be to decouple
-    // merge priority from token index or to prevent specific token merges.
-    loop {
-        if parts.len() == 1 {
-            break;
+    // n is often very small so considerations like cache-locality outweigh the algorithmic
+    // complexity downsides of the `parts` vector.
+    while min_rank.0 != Rank::MAX {
+        let i = min_rank.1;
+        // Update parts[i] and parts[i - 1] before removing parts[i + 1], since
+        // `parts.remove(i + 1)` will thrash the cache.
+        if i > 0 {
+            parts[i - 1].1 = get_rank(&parts, i - 1);
         }
+        parts[i].1 = get_rank(&parts, i);
+        parts.remove(i + 1);
 
-        // usize::MAX is a sentinel rank value allowing us to
-        // take the min more quickly
-        let mut min_rank: (usize, usize) = (usize::MAX, 0);
+        min_rank = (Rank::MAX, usize::MAX);
         for (i, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
             if rank < min_rank.0 {
                 min_rank = (rank, i);
             }
         }
-
-        if min_rank.0 != usize::MAX {
-            let i = min_rank.1;
-
-            // NOTE: We are about to remove parts[i + 1]. We do not do it
-            // yet because there are cache-locality benefits to updating
-            // parts[i] and parts[i-1] before removing, which could thrash
-            // the cache. Thus, we update the rank calculation by skipping over
-            // parts[i + 1], by invoking `get_rank!` with `skip = 1`.
-            parts[i].1 = get_rank!(i, 1).unwrap_or(usize::MAX);
-            if i > 0 {
-                parts[i - 1].1 = get_rank!(i - 1, 1).unwrap_or(usize::MAX);
-            }
-
-            parts.remove(i + 1);
-        } else {
-            break;
-        }
     }
-    let mut out: Vec<T> = Vec::with_capacity(parts.len() - 1);
-    for i in 0..parts.len() - 1 {
-        out.push(f(parts[i].0..parts[i + 1].0));
-    }
-    out
+    parts
 }
 
-pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, usize>) -> Vec<usize> {
-    if piece.len() == 1 {
-        return vec![ranks[piece]];
-    }
-    _byte_pair_merge(piece, ranks, |p| ranks[&piece[p.start..p.end]])
+pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    assert!(piece.len() > 1);
+    _byte_pair_merge(ranks, piece)
+        .windows(2)
+        .map(|part| ranks[&piece[part[0].0..part[1].0]])
+        .collect()
 }
 
-pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, usize>) -> Vec<&'a [u8]> {
-    if piece.len() == 1 {
-        return vec![piece];
-    }
-    _byte_pair_merge(piece, ranks, |p| &piece[p.start..p.end])
+pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<&'a [u8]> {
+    assert!(piece.len() > 1);
+    _byte_pair_merge(ranks, piece)
+        .windows(2)
+        .map(|part| &piece[part[0].0..part[1].0])
+        .collect()
 }
 
 // Various performance notes:
@@ -166,7 +127,6 @@ pub fn byte_pair_split<'a>(piece: &'a [u8], ranks: &HashMap<Vec<u8>, usize>) -> 
 // The current implementation ends up doing a lot of hashing of bytes. In theory, this could be made
 // to be hashing of two-tuples of ints, which looks like it may also be a couple percent faster.
 
-use std::num::NonZeroU64;
 pub struct FakeThreadId(NonZeroU64);
 
 fn hash_current_thread() -> usize {
@@ -174,36 +134,22 @@ fn hash_current_thread() -> usize {
     // that works great for our use case of avoiding collisions in our array. Unfortunately,
     // it's private. However, there are only so many ways you can layout a u64, so just transmute
     // https://github.com/rust-lang/rust/issues/67939
-    const _: [u8; 8] = [0; std::mem::size_of::<std::thread::ThreadId>()];
+    const _: [u8; 8] = [0; std::mem::size_of::<thread::ThreadId>()];
     const _: [u8; 8] = [0; std::mem::size_of::<FakeThreadId>()];
-    let x = unsafe {
-        std::mem::transmute::<std::thread::ThreadId, FakeThreadId>(thread::current().id()).0
-    };
+    let x =
+        unsafe { std::mem::transmute::<thread::ThreadId, FakeThreadId>(thread::current().id()).0 };
     u64::from(x) as usize
 }
 
 const MAX_NUM_THREADS: usize = 128;
-#[cfg(feature = "python")]
-#[pyclass]
-#[derive(Clone)]
-pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, usize>,
-    special_tokens_encoder: HashMap<String, usize>,
-    decoder: HashMap<usize, Vec<u8>>,
-    special_tokens_decoder: HashMap<usize, Vec<u8>>,
-    regex_tls: Vec<Regex>,
-    special_regex_tls: Vec<Regex>,
-    sorted_token_bytes: Vec<Vec<u8>>,
-}
 
-#[cfg(not(feature = "python"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // sorted_token_bytes is used but is read only in python version
 pub struct CoreBPE {
-    encoder: HashMap<Vec<u8>, usize>,
-    special_tokens_encoder: HashMap<String, usize>,
-    decoder: HashMap<usize, Vec<u8>>,
-    special_tokens_decoder: HashMap<usize, Vec<u8>>,
+    encoder: HashMap<Vec<u8>, Rank>,
+    special_tokens_encoder: HashMap<String, Rank>,
+    decoder: HashMap<Rank, Vec<u8>>,
+    special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex_tls: Vec<Regex>,
     special_regex_tls: Vec<Regex>,
     sorted_token_bytes: Vec<Vec<u8>>,
@@ -221,10 +167,7 @@ impl CoreBPE {
         &self.special_regex_tls[hash_current_thread() % MAX_NUM_THREADS]
     }
 
-    /// Given a list of tokens, return a vector of bytes
-    ///
-    /// The output is NOT guaranteed to be valid UTF-8
-    pub fn _decode_native(&self, tokens: &[usize]) -> Vec<u8> {
+    pub fn _decode_native(&self, tokens: &[Rank]) -> Vec<u8> {
         let mut ret = Vec::with_capacity(tokens.len() * 2);
         for token in tokens {
             let token_bytes = self
@@ -238,7 +181,7 @@ impl CoreBPE {
 
     pub fn _decode_native_and_split(
         &self,
-        tokens: Vec<usize>,
+        tokens: Vec<Rank>,
     ) -> impl Iterator<Item = Vec<u8>> + '_ {
         tokens.into_iter().map(|token| {
             let token_bytes = self
@@ -249,23 +192,22 @@ impl CoreBPE {
         })
     }
 
-    fn _encode_ordinary_native(&self, text: &str) -> Vec<usize> {
+    fn _encode_ordinary_native(&self, text: &str) -> Vec<Rank> {
         // This is the core of the encoding logic; the other functions in here
         // just make things complicated :-)
         let regex = self._get_tl_regex();
         let mut ret = vec![];
         for mat in regex.find_iter(text) {
             let piece = mat.unwrap().as_str().as_bytes();
-            if let Some(token) = self.encoder.get(piece) {
-                ret.push(*token);
-                continue;
+            match self.encoder.get(piece) {
+                Some(token) => ret.push(*token),
+                None => ret.extend(&byte_pair_encode(piece, &self.encoder)),
             }
-            ret.extend(&byte_pair_encode(piece, &self.encoder));
         }
         ret
     }
 
-    fn _encode_native(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<usize>, usize) {
+    fn _encode_native(&self, text: &str, allowed_special: &HashSet<&str>) -> (Vec<Rank>, usize) {
         let special_regex = self._get_tl_special_regex();
         let regex = self._get_tl_regex();
         let mut ret = vec![];
@@ -323,9 +265,9 @@ impl CoreBPE {
 
     fn _increase_last_piece_token_len(
         &self,
-        tokens: Vec<usize>,
+        tokens: Vec<Rank>,
         mut last_piece_token_len: usize,
-    ) -> (Vec<usize>, usize) {
+    ) -> (Vec<Rank>, usize) {
         // Unfortunately, the locations where our regex splits can be unstable.
         // For the purposes of determining unstable tokens, unstable regex splitting
         // is only a problem if a split that was present disappears, since this can
@@ -364,7 +306,7 @@ impl CoreBPE {
         &self,
         text: &str,
         allowed_special: &HashSet<&str>,
-    ) -> (Vec<usize>, HashSet<Vec<usize>>) {
+    ) -> (Vec<Rank>, HashSet<Vec<Rank>>) {
         let (tokens, last_piece_token_len) = self._encode_native(text, allowed_special);
         if last_piece_token_len == 0 {
             // If last_piece_token_len is zero, the last token was a special token and we have
@@ -485,10 +427,9 @@ impl CoreBPE {
 
     // This function a copy of the similar function in python API, but it return
     // Rust's results and errors
-    #[cfg(not(feature = "python"))]
     pub fn new(
-        encoder: HashMap<Vec<u8>, usize>,
-        special_tokens_encoder: HashMap<String, usize>,
+        encoder: HashMap<Vec<u8>, Rank>,
+        special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
     ) -> Result<Self> {
         let regex = Regex::new(pattern).map_err(|e| anyhow!(e.to_string()))?;
@@ -501,12 +442,12 @@ impl CoreBPE {
             Regex::new(&_parts.join("|")).map_err(|e| anyhow!(e.to_string()))?
         };
 
-        let decoder: HashMap<usize, Vec<u8>> =
+        let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
 
         assert!(encoder.len() == decoder.len());
 
-        let special_tokens_decoder: HashMap<usize, Vec<u8>> = special_tokens_encoder
+        let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
             .iter()
             .map(|(k, v)| (*v, k.as_bytes().to_vec()))
             .collect();
@@ -528,15 +469,15 @@ impl CoreBPE {
         })
     }
 
-    pub fn encode_ordinary(&self, text: &str) -> Vec<usize> {
+    pub fn encode_ordinary(&self, text: &str) -> Vec<Rank> {
         self._encode_ordinary_native(text)
     }
 
-    pub fn encode(&self, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
+    pub fn encode(&self, text: &str, allowed_special: HashSet<&str>) -> Vec<Rank> {
         self._encode_native(text, &allowed_special).0
     }
 
-    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<usize> {
+    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<Rank> {
         let allowed_special = self
             .special_tokens_encoder
             .keys()
@@ -552,7 +493,7 @@ impl CoreBPE {
     /// Decode a vector of tokens into a valid UTF-8 String
     ///
     /// If unicode validation is not wanted, see _decode_native.
-    pub fn decode(&self, tokens: Vec<usize>) -> Result<String> {
+    pub fn decode(&self, tokens: Vec<Rank>) -> Result<String> {
         match String::from_utf8(self._decode_native(&tokens)) {
             Ok(text) => Ok(text),
             Err(e) => Err(anyhow!("Unable to decode into a valid UTF-8 string: {}", e)),
@@ -638,141 +579,27 @@ impl CoreBPE {
     }
 }
 
-#[cfg(feature = "python")]
-#[pymethods]
-impl CoreBPE {
-    #[new]
-    pub fn new(
-        encoder: HashMap<Vec<u8>, usize>,
-        special_tokens_encoder: HashMap<String, usize>,
-        pattern: &str,
-    ) -> PyResult<Self> {
-        let regex = Regex::new(pattern)
-            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
-
-        let special_regex = {
-            let _parts = special_tokens_encoder
-                .keys()
-                .map(|s| fancy_regex::escape(s))
-                .collect::<Vec<_>>();
-            Regex::new(&_parts.join("|"))
-                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?
-        };
-
-        let decoder: HashMap<usize, Vec<u8>> =
-            encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
-
-        assert!(encoder.len() == decoder.len());
-
-        let special_tokens_decoder: HashMap<usize, Vec<u8>> = special_tokens_encoder
-            .iter()
-            .map(|(k, v)| (*v, k.as_bytes().to_vec()))
-            .collect();
-
-        // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
-
-        Ok(CoreBPE {
-            encoder,
-            special_tokens_encoder,
-            decoder,
-            special_tokens_decoder,
-            regex_tls: (0..MAX_NUM_THREADS).map(|_| regex.clone()).collect(),
-            special_regex_tls: (0..MAX_NUM_THREADS)
-                .map(|_| special_regex.clone())
-                .collect(),
-            sorted_token_bytes,
-        })
-    }
-
-    // ====================
-    // Encoding
-    // ====================
-
-    fn encode_with_unstable(
-        &self,
-        py: Python,
-        text: &str,
-        allowed_special: HashSet<&str>,
-    ) -> Py<PyTuple> {
-        let (tokens, completions) =
-            py.allow_threads(|| self._encode_unstable_native(text, &allowed_special));
-        let py_completions =
-            PyList::new(py, completions.iter().map(|seq| PyList::new(py, &seq[..])));
-        (tokens, py_completions).into_py(py)
-    }
-
-    fn encode_single_token(&self, piece: &[u8]) -> PyResult<usize> {
-        if let Some(token) = self.encoder.get(piece).copied() {
-            return Ok(token);
-        }
-        if let Ok(piece_str) = std::str::from_utf8(piece) {
-            if let Some(token) = self.special_tokens_encoder.get(piece_str).copied() {
-                return Ok(token);
-            }
-        }
-        Err(PyErr::new::<exceptions::PyKeyError, _>(piece.to_owned()))
-    }
-
-    pub fn encode_single_piece(&self, piece: &[u8]) -> Vec<usize> {
-        if let Some(token) = self.encoder.get(piece) {
-            return vec![*token];
-        }
-        byte_pair_encode(piece, &self.encoder)
-    }
-
-    // ====================
-    // Decoding
-    // ====================
-
-    pub fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
-        let bytes = py.allow_threads(|| self._decode_native(&tokens));
-        PyBytes::new(py, &bytes).into()
-    }
-
-    pub fn decode_single_token_bytes(&self, py: Python, token: usize) -> PyResult<Py<PyBytes>> {
-        if let Some(bytes) = self.decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
-        }
-        if let Some(bytes) = self.special_tokens_decoder.get(&token) {
-            return Ok(PyBytes::new(py, bytes).into());
-        }
-        Err(PyErr::new::<exceptions::PyKeyError, _>(token.to_string()))
-    }
-
-    // ====================
-    // Miscellaneous
-    // ====================
-
-    pub fn token_byte_values(&self, py: Python) -> Vec<Py<PyBytes>> {
-        self.sorted_token_bytes
-            .iter()
-            .map(|x| PyBytes::new(py, x).into())
-            .collect()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pymodule]
-fn _tiktoken(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<CoreBPE>()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use rustc_hash::FxHashMap as HashMap;
 
-    use super::byte_pair_split;
+    use super::{byte_pair_split, Rank};
+
+    fn setup_ranks() -> HashMap<Vec<u8>, Rank> {
+        HashMap::from_iter([(b"ab".to_vec(), 0), (b"cd".to_vec(), 1)])
+    }
 
     #[test]
-    fn very_simple_test() {
-        let mut ranks = HashMap::default();
-        ranks.insert(b"ab".to_vec(), 1);
-        ranks.insert(b"cd".to_vec(), 2);
-
+    fn test_simple_characters() {
+        let ranks = setup_ranks();
         let res = byte_pair_split(b"abcd", &ranks);
         assert_eq!(res, vec![b"ab", b"cd"]);
+    }
+
+    #[test]
+    fn test_repeated_characters() {
+        let ranks = setup_ranks();
+        let res = byte_pair_split(b"abab", &ranks);
+        assert_eq!(res, vec![b"ab", b"ab"]);
     }
 }
