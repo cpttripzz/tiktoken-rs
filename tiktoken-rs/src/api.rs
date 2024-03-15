@@ -370,18 +370,57 @@ pub mod async_openai {
         }
     }
 
-    impl From<&async_openai::types::ChatCompletionRequestMessage>
-        for super::ChatCompletionRequestMessage
-    {
+    impl From<&async_openai::types::ChatCompletionRequestMessage> for super::ChatCompletionRequestMessage {
         fn from(m: &async_openai::types::ChatCompletionRequestMessage) -> Self {
-            Self {
-                role: m.role.to_string(),
-                name: m.name.clone(),
-                content: m.content.clone(),
-                function_call: m.function_call.as_ref().map(|f| f.into()),
+            match m {
+                async_openai::types::ChatCompletionRequestMessage::System(system_message) => Self {
+                    role: "system".to_string(),
+                    content: Some(system_message.content.clone()),
+                    name: system_message.name.clone(),
+                    function_call: None,
+                },
+                async_openai::types::ChatCompletionRequestMessage::User(user_message) => {
+                    let content_str = match &user_message.content {
+                        async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => text.clone(),
+                        async_openai::types::ChatCompletionRequestUserMessageContent::Array(parts) => {
+                            parts.iter().filter_map(|part| {
+                                match part {
+                                    async_openai::types::ChatCompletionRequestMessageContentPart::Text(text_part) => Some(text_part.clone().text),
+                                    async_openai::types::ChatCompletionRequestMessageContentPart::Image(_) => None,
+                                }
+                            }).collect::<Vec<String>>().join(", ")
+                        },
+                    };
+
+                    Self {
+                        role: "user".to_string(),
+                        content: Some(content_str),
+                        name: user_message.name.clone(),
+                        function_call: None,
+                    }
+                },
+                async_openai::types::ChatCompletionRequestMessage::Assistant(assistant_message) => Self {
+                    role: "assistant".to_string(),
+                    content: assistant_message.content.clone(),
+                    name: assistant_message.name.clone(),
+                    function_call: None,
+                },
+                async_openai::types::ChatCompletionRequestMessage::Tool(tool_message) => Self {
+                    role: "tool".to_string(),
+                    content: Some(tool_message.content.clone()),
+                    name: None,
+                    function_call: None,
+                },
+                async_openai::types::ChatCompletionRequestMessage::Function(function_message) => Self {
+                    role: "function".to_string(),
+                    content: function_message.content.clone(),
+                    name: None,
+                    function_call: None,
+                },
             }
         }
     }
+
 
     /// Calculates the total number of tokens for the given list of messages.
     ///
